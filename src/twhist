@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+
+# @describe Twitter username OSINT tool using CDX (Common Crawl Index)
+# @arg username! "Twitter username to search for (without @)" [string]
+# @option -o --output "Output format (pretty, raw, json)" [string] @default "pretty"
+# @option -l --limit "Limit number of results (0 for no limit)" [int] @default "0"
+# @option -s --sort "Sort results by (username, count, first_seen, last_seen)" [string] @default "count"
+# @option -r --reverse "Reverse sort order" [flag]
+# @option -f --filter "Filter usernames containing this string" [string]
+# @option -m --min-count "Minimum tweet count to include" [int] @default "1"
+# @option --show-urls "Show sample URLs for each username" [flag]
+# @option --show-dates "Show first/last seen dates" [flag]
+# @flag   -q --quiet "Suppress colored output and progress indicators"
+# @flag   -v --verbose "Show detailed information including sample URLs"
+# @meta require-tools curl,awk,sed,sort,uniq,date
+
+eval "$(argc --argc-eval "$0" "$@" 2>/dev/null)"
+
+setup_colors() {
+  if [ "$argc_quiet" = 1 ] || [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
+    bold="" reset="" blue="" green="" yellow="" cyan="" magenta="" red="" gray=""
+  else
+    bold=$(tput bold) reset=$(tput sgr0) blue=$(tput setaf 4) green=$(tput setaf 2)
+    yellow=$(tput setaf 3) cyan=$(tput setaf 6) magenta=$(tput setaf 5) red=$(tput setaf 1)
+    gray=$(tput setaf 8)
+  fi
+}
+setup_colors
+
+show_progress() {
+  if [ "$argc_quiet" != 1 ]; then
+    printf "${gray}%s${reset}\n" "$1" >&2
+  fi
+}
+
+error_exit() {
+  printf "${red}Error:${reset} %s\n" "$1" >&2
+  exit 1
+}
+
+validate_username() {
+  local username="$1"
+  username="${username#@}"
+
+  if [[ ! "$username" =~ ^[a-zA-Z0-9_]+$ ]]; then
+    error_exit "Invalid Twitter username format: $username"
+  fi
+
+  echo "$username"
+}
+
+timestamp_to_date() {
+  local timestamp="$1"
+  if [ ${#timestamp} -eq 14 ]; then
+    local year="${timestamp:0:4}"
+    local month="${timestamp:4:2}"
+    local day="${timestamp:6:2}"
+    echo "${year}-${month}-${day}"
+  else
+    echo "Unknown"
+  fi
+}
+
+fetch_cdx_data() {
+  local username="$1"
+  local url="http://web.archive.org/cdx/search/cdx?url=https://twitter.com/${username}*&output=text&fl=timestamp,original&collapse=urlkey"
+
+  show_progress "Querying CDX for username: ${username}"
+
+  local response=$(curl -s "$url" 2>/dev/null)
+  local curl_exit=$?
+
+  if [ $curl_exit -ne 0 ]; then
+    error_exit "Failed to fetch data from CDX API (curl exit code: $curl_exit)"
+  fi
+
+  if [ -z "$response" ]; then
+    show_progress "No data found for username: ${username}"
+    return 1
+  fi
+
+  echo "$response"
+}
+
+process_cdx_data() {
+  local cdx_data="$1"
+  local temp_file=$(mktemp)
+  local processed_file=$(mktemp)
+  local raw_data_file=$(mktemp)
+  
+  # Write CDX data to a temporary file to avoid pipe issues
+  echo "$cdx_data" > "$raw_data_file"
+  
+  # Count the total number of lines for progress reporting
+  local total_lines=$(wc -l < "$raw_data_file")
+  show_progress "Processing $total_lines records from CDX data..."
+  
+  # Use a timeout to prevent hanging
+  local timeout_seconds=300  # 5 minutes timeout
+  local start_time=$(date +%s)
+  local line_count=0
+  local progress_interval=$((total_lines > 100 ? total_lines / 10 : 10))
+  
+  # Process the data line by line from the file instead of using a pipe
+  while IFS=' ' read -r timestamp original_url; do
+    [ -z "$timestamp" ] || [ -z "$original_url" ] && continue
+    
+    # Check for timeout
+    local current_time=$(date +%s)
+    local elapsed_time=$((current_time - start_time))
+    if [ $elapsed_time -gt $timeout_seconds ]; then
+      show_progress "Processing timed out after ${timeout_seconds} seconds. Processing partial results..."
+      break
+    fi
+    
+    line_count=$((line_count + 1))
+    
+    # Show progress every 10% or 10 lines
+    if [ $((line_count % progress_interval)) -eq 0 ]; then
+      show_progress "Processed $line_count of $total_lines records ($(( line_count * 100 / total_lines ))%)..."
+    fi
+
+    local extracted_username=$(echo "$original_url" | sed 's|https://twitter.com/||' | cut -d'/' -f1 | cut -d'?' -f1)
+
+    [ -z "$extracted_username" ] && continue
+    
+    # Skip invalid usernames like "http:"
+    [[ "$extracted_username" == "http:" ]] && continue
+    [[ ! "$extracted_username" =~ ^[a-zA-Z0-9_]+$ ]] && continue
+
+    if [ -n "$argc_filter" ]; then
+      if [[ ! "$extracted_username" == *"$argc_filter"* ]]; then
+        continue
+      fi
+    fi
+
+    echo "$timestamp|$extracted_username|$original_url" >> "$temp_file"
+  done < "$raw_data_file"
+  
+  # Check if we processed any data
+  if [ ! -s "$temp_file" ]; then
+    show_progress "No usernames found in the processed data."
+    rm -f "$temp_file" "$processed_file" "$raw_data_file"
+    return 1
+  fi
+  
+  show_progress "Aggregating data for usernames..."
+
+  awk -F'|' '
+  {
+    timestamp = $1
+    username = $2
+    url = $3
+    
+    count[username]++
+    
+    if (username in first_seen) {
+      if (timestamp < first_seen[username]) {
+        first_seen[username] = timestamp
+      }
+    } else {
+      first_seen[username] = timestamp
+    }
+    
+    if (username in last_seen) {
+      if (timestamp > last_seen[username]) {
+        last_seen[username] = timestamp
+      }
+    } else {
+      last_seen[username] = timestamp
+    }
+    
+    if (sample_url[username] == "") {
+      sample_url[username] = url
+    }
+  }
+  END {
+    for (u in count) {
+      if (count[u] >= '"${argc_min_count:-1}"') {
+        print u "|" count[u] "|" first_seen[u] "|" last_seen[u] "|" sample_url[u]
+      }
+    }
+  }' "$temp_file" >"$processed_file"
+
+  local sort_field=""
+  case "$argc_sort" in
+  "username") sort_field="-k1,1" ;;
+  "count") sort_field="-k2,2n" ;;
+  "first_seen") sort_field="-k3,3" ;;
+  "last_seen") sort_field="-k4,4" ;;
+  *) sort_field="-k2,2n" ;;
+  esac
+
+  if [ "$argc_reverse" = 1 ]; then
+    sort_field="${sort_field}r"
+  fi
+
+  sort -t'|' $sort_field "$processed_file"
+
+  rm -f "$temp_file" "$processed_file"
+}
+
+output_raw() {
+  local processed_data="$1"
+  local count=0
+  local temp_file=$(mktemp)
+  
+  # Write processed data to a temporary file to avoid pipe issues
+  echo "$processed_data" > "$temp_file"
+  
+  while IFS='|' read -r username tweet_count first_seen last_seen sample_url; do
+    [ -z "$username" ] && continue
+
+    if [ "${argc_limit:-0}" -gt 0 ] && [ $count -ge "${argc_limit:-0}" ]; then
+      break
+    fi
+
+    echo "$username"
+    count=$((count + 1))
+  done < "$temp_file"
+  
+  rm -f "$temp_file"
+}
+
+output_json() {
+  local processed_data="$1"
+  local count=0
+  local first=1
+  local temp_file=$(mktemp)
+  
+  # Write processed data to a temporary file to avoid pipe issues
+  echo "$processed_data" > "$temp_file"
+
+  echo "["
+
+  while IFS='|' read -r username tweet_count first_seen last_seen sample_url; do
+    [ -z "$username" ] && continue
+
+    if [ "${argc_limit:-0}" -gt 0 ] && [ $count -ge "${argc_limit:-0}" ]; then
+      break
+    fi
+
+    if [ $first -eq 1 ]; then
+      first=0
+    else
+      echo ","
+    fi
+
+    local first_date=$(timestamp_to_date "$first_seen")
+    local last_date=$(timestamp_to_date "$last_seen")
+
+    printf '  {\n'
+    printf '    "username": "%s",\n' "$username"
+    printf '    "tweet_count": %s,\n' "$tweet_count"
+    printf '    "first_seen": "%s",\n' "$first_date"
+    printf '    "last_seen": "%s",\n' "$last_date"
+    printf '    "sample_url": "%s"\n' "$sample_url"
+    printf '  }'
+
+    count=$((count + 1))
+  done < "$temp_file"
+
+  rm -f "$temp_file"
+  echo ""
+  echo "]"
+}
+
+output_pretty() {
+  local processed_data="$1"
+  local total_usernames=$(echo "$processed_data" | wc -l)
+  local total_tweets=0
+  local count=0
+  local temp_file=$(mktemp)
+  
+  # Write processed data to a temporary file to avoid pipe issues
+  echo "$processed_data" > "$temp_file"
+
+  while IFS='|' read -r username tweet_count first_seen last_seen sample_url; do
+    [ -z "$username" ] && continue
+    total_tweets=$((total_tweets + tweet_count))
+  done < "$temp_file"
+
+  printf "${bold}${green}Twitter Username OSINT Results${reset}\n"
+  printf "${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}\n\n"
+
+  printf "${bold}Summary:${reset}\n"
+  printf "  ${cyan}Total Usernames Found:${reset} ${yellow}%s${reset}\n" "$total_usernames"
+  printf "  ${cyan}Total Archived Tweets:${reset} ${yellow}%s${reset}\n" "$total_tweets"
+  printf "  ${cyan}Minimum Tweet Count:${reset} ${yellow}%s${reset}\n" "${argc_min_count:-1}"
+  if [ -n "$argc_filter" ]; then
+    printf "  ${cyan}Filter Applied:${reset} ${yellow}%s${reset}\n" "$argc_filter"
+  fi
+  printf "  ${cyan}Sort Order:${reset} ${yellow}%s${reset}" "${argc_sort:-count}"
+  [ "$argc_reverse" = 1 ] && printf " ${gray}(reversed)${reset}"
+  printf "\n\n"
+
+  printf "${bold}Results:${reset}\n"
+  printf "${bold}%-20s %8s %12s %12s${reset}" "Username" "Tweets" "First Seen" "Last Seen"
+  if [ "$argc_show_urls" = 1 ] || [ "$argc_verbose" = 1 ]; then
+    printf " %s" "Sample URL"
+  fi
+  printf "\n"
+  printf "${gray}%-20s %8s %12s %12s" "--------" "------" "-----------" "----------"
+  if [ "$argc_show_urls" = 1 ] || [ "$argc_verbose" = 1 ]; then
+    printf " %s" "----------"
+  fi
+  printf "${reset}\n"
+
+  while IFS='|' read -r username tweet_count first_seen last_seen sample_url; do
+    [ -z "$username" ] && continue
+
+    if [ "${argc_limit:-0}" -gt 0 ] && [ $count -ge "${argc_limit:-0}" ]; then
+      break
+    fi
+
+    local first_date=$(timestamp_to_date "$first_seen")
+    local last_date=$(timestamp_to_date "$last_seen")
+
+    local count_color="$reset"
+    if [ "${tweet_count:-0}" -gt 100 ]; then
+      count_color="$green"
+    elif [ "${tweet_count:-0}" -gt 10 ]; then
+      count_color="$yellow"
+    else
+      count_color="$red"
+    fi
+
+    printf "${blue}%-20s${reset} ${count_color}%8s${reset} ${magenta}%12s${reset} ${magenta}%12s${reset}" \
+      "$username" "$tweet_count" "$first_date" "$last_date"
+
+    if [ "$argc_show_urls" = 1 ] || [ "$argc_verbose" = 1 ]; then
+      printf " ${gray}%s${reset}" "$sample_url"
+    fi
+    printf "\n"
+
+    if [ "$argc_show_dates" = 1 ] && [ "$argc_show_urls" != 1 ] && [ "$argc_verbose" != 1 ]; then
+      printf "  ${gray}First: %s, Last: %s${reset}\n" "$first_date" "$last_date"
+    fi
+
+    count=$((count + 1))
+  done < "$temp_file"
+  
+  rm -f "$temp_file"
+
+  if [ "${argc_limit:-0}" -gt 0 ] && [ "$total_usernames" -gt "${argc_limit:-0}" ]; then
+    printf "\n${gray}Showing %s of %s results (use --limit 0 to show all)${reset}\n" "$argc_limit" "$total_usernames"
+  fi
+}
+
+main() {
+  local username=$(validate_username "$argc_username")
+  local cdx_data=$(fetch_cdx_data "$username")
+
+  if [ -z "$cdx_data" ]; then
+    if [ "$argc_output" = "json" ]; then
+      echo "[]"
+    else
+      show_progress "No usernames found for: ${username}"
+    fi
+    exit 0
+  fi
+
+  show_progress "Processing CDX data..."
+  local processed_data=$(process_cdx_data "$cdx_data")
+
+  if [ -z "$processed_data" ]; then
+    if [ "$argc_output" = "json" ]; then
+      echo "[]"
+    else
+      show_progress "No usernames found matching criteria"
+    fi
+    exit 0
+  fi
+
+  case "$argc_output" in
+  "raw")
+    output_raw "$processed_data"
+    ;;
+  "json")
+    output_json "$processed_data"
+    ;;
+  "pretty" | *)
+    output_pretty "$processed_data"
+    ;;
+  esac
+}
+
+main
