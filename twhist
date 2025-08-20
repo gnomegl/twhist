@@ -297,15 +297,36 @@ process_cdx_data() {
   local oembed_count=0
   local max_oembed_checks=5000
   local checked_usernames=""
+  
+  # Create a temporary file with unique username-URL pairs to avoid subshell issues
+  local unique_usernames_file=$(mktemp)
+  awk -F'|' '{print $2 "|" $3}' "$temp_file" | sort -u > "$unique_usernames_file"
+  
+  # Count total unique usernames for progress reporting (actual unique usernames, not username-URL pairs)
+  local total_unique_usernames=$(awk -F'|' '{print $2}' "$temp_file" | sort -u | wc -l)
+  local usernames_processed=0
+  
+  # Limit to 4 username checks for progress display
+  local max_progress_checks=4
+  if [ $total_unique_usernames -lt $max_progress_checks ]; then
+    max_progress_checks=$total_unique_usernames
+  fi
 
-  awk -F'|' '{print $2 "|" $3}' "$temp_file" | sort -u | while IFS='|' read -r username url; do
+  while IFS='|' read -r username url; do
     # Skip if we already checked this username
     if [[ "$checked_usernames" == *"|$username|"* ]]; then
       continue
     fi
+    
+    # Only show progress for first 4 usernames
+    if [ $usernames_processed -lt $max_progress_checks ]; then
+      usernames_processed=$((usernames_processed + 1))
+      show_progress "Processing username... $usernames_processed of $max_progress_checks: $username"
+    fi
 
     # Limit oEmbed checks for performance
     if [ $oembed_count -ge $max_oembed_checks ]; then
+      show_progress "Reached maximum verification limit ($max_oembed_checks checks)"
       break
     fi
 
@@ -340,7 +361,10 @@ process_cdx_data() {
         fi
       fi
     fi
-  done
+  done < "$unique_usernames_file"
+  
+  # Show completion message
+  show_progress "Username verification completed"
 
   # Load oEmbed data into memory for enrichment
   declare -A oembed_names
@@ -429,7 +453,7 @@ process_cdx_data() {
     echo "=END_USERNAME_CHANGES="
   fi
 
-  rm -f "$temp_file" "$processed_file" "$raw_data_file" "$oembed_file" "$username_changes_file" "$enriched_file"
+  rm -f "$temp_file" "$processed_file" "$raw_data_file" "$oembed_file" "$username_changes_file" "$enriched_file" "$unique_usernames_file"
 }
 
 output_raw() {
@@ -540,8 +564,7 @@ output_pretty() {
       total_tweets=$((total_tweets + tweet_count))
     done
 
-  printf "${bold}${green}Twitter Username OSINT Results${reset}\n"
-  printf "${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}\n\n"
+  printf "${bold}${green}twhist Results:${reset}\n"
 
   # printf "${bold}Summary:${reset}\n"
   # printf "  ${cyan}Total Usernames Found:${reset} ${yellow}%s${reset}\n" "$total_usernames"
@@ -554,7 +577,6 @@ output_pretty() {
   # [ "$REVERSE" = 1 ] && printf " ${gray}(reversed)${reset}"
   # printf "\n\n"
 
-  printf "${bold}Results:${reset}\n"
   printf "${bold}%-40s %8s %12s %12s${reset}" "Username" "Tweets" "First Seen" "Last Seen"
   if [ "$SHOW_URLS" = 1 ] || [ "$VERBOSE" = 1 ]; then
     printf " %s" "Sample URL"
