@@ -321,7 +321,7 @@ process_cdx_data() {
     # Only show progress for first 4 usernames
     if [ $usernames_processed -lt $max_progress_checks ]; then
       usernames_processed=$((usernames_processed + 1))
-      show_progress "Processing username... $usernames_processed of $max_progress_checks: $username"
+      show_progress "Processing username... $usernames_processed of $max_progress_checks"
     fi
 
     # Limit oEmbed checks for performance
@@ -564,7 +564,7 @@ output_pretty() {
       total_tweets=$((total_tweets + tweet_count))
     done
 
-  printf "${bold}${green}twhist Results:${reset}\n"
+  printf "${bold}${green}Results:${reset}\n"
 
   # printf "${bold}Summary:${reset}\n"
   # printf "  ${cyan}Total Usernames Found:${reset} ${yellow}%s${reset}\n" "$total_usernames"
