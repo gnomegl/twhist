@@ -357,7 +357,7 @@ process_cdx_data() {
     done <"$oembed_file"
 
     # Debug: show loaded data
-    show_progress "Loaded ${#oembed_names[@]} oEmbed entries"
+    # show_progress "Loaded ${#oembed_names[@]} oEmbed entries"
   fi
 
   awk -F'|' '
@@ -543,16 +543,16 @@ output_pretty() {
   printf "${bold}${green}Twitter Username OSINT Results${reset}\n"
   printf "${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}\n\n"
 
-  printf "${bold}Summary:${reset}\n"
-  printf "  ${cyan}Total Usernames Found:${reset} ${yellow}%s${reset}\n" "$total_usernames"
-  printf "  ${cyan}Total Archived Tweets:${reset} ${yellow}%s${reset}\n" "$total_tweets"
-  printf "  ${cyan}Minimum Tweet Count:${reset} ${yellow}%s${reset}\n" "$MIN_COUNT"
-  if [ -n "$FILTER" ]; then
-    printf "  ${cyan}Filter Applied:${reset} ${yellow}%s${reset}\n" "$FILTER"
-  fi
-  printf "  ${cyan}Sort Order:${reset} ${yellow}%s${reset}" "$SORT"
-  [ "$REVERSE" = 1 ] && printf " ${gray}(reversed)${reset}"
-  printf "\n\n"
+  # printf "${bold}Summary:${reset}\n"
+  # printf "  ${cyan}Total Usernames Found:${reset} ${yellow}%s${reset}\n" "$total_usernames"
+  # printf "  ${cyan}Total Archived Tweets:${reset} ${yellow}%s${reset}\n" "$total_tweets"
+  # printf "  ${cyan}Minimum Tweet Count:${reset} ${yellow}%s${reset}\n" "$MIN_COUNT"
+  # if [ -n "$FILTER" ]; then
+  #   printf "  ${cyan}Filter Applied:${reset} ${yellow}%s${reset}\n" "$FILTER"
+  # fi
+  # printf "  ${cyan}Sort Order:${reset} ${yellow}%s${reset}" "$SORT"
+  # [ "$REVERSE" = 1 ] && printf " ${gray}(reversed)${reset}"
+  # printf "\n\n"
 
   printf "${bold}Results:${reset}\n"
   printf "${bold}%-40s %8s %12s %12s${reset}" "Username" "Tweets" "First Seen" "Last Seen"
