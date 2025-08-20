@@ -216,11 +216,27 @@ fetch_cdx_data() {
   echo "$response"
 }
 
+fetch_oembed_data() {
+  local tweet_url="$1"
+  local oembed_url="https://publish.twitter.com/oembed?url=${tweet_url}"
+
+  local response=$(curl -s "$oembed_url" 2>/dev/null)
+
+  # Check if response contains actual oEmbed data
+  if echo "$response" | grep -q '"author_name"'; then
+    echo "$response"
+  else
+    echo ""
+  fi
+}
+
 process_cdx_data() {
   local cdx_data="$1"
   local temp_file=$(mktemp)
   local processed_file=$(mktemp)
   local raw_data_file=$(mktemp)
+  local oembed_file=$(mktemp)
+  local username_changes_file=$(mktemp)
 
   # Write CDX data to a temporary file to avoid pipe issues
   echo "$cdx_data" >"$raw_data_file"
@@ -274,11 +290,70 @@ process_cdx_data() {
   # Check if we processed any data
   if [ ! -s "$temp_file" ]; then
     show_progress "No usernames found in the processed data."
-    rm -f "$temp_file" "$processed_file" "$raw_data_file"
+    rm -f "$temp_file" "$processed_file" "$raw_data_file" "$oembed_file" "$username_changes_file"
     return 1
   fi
 
   show_progress "Aggregating data for usernames..."
+
+  # Collect oEmbed data for a sample of tweets per username
+  show_progress "Fetching oEmbed data for username verification..."
+
+  # Get unique usernames and their sample URLs (limit to 10 for performance)
+  local oembed_count=0
+  local max_oembed_checks=10
+  local checked_usernames=""
+
+  awk -F'|' '{print $2 "|" $3}' "$temp_file" | sort -u | while IFS='|' read -r username url; do
+    # Skip if we already checked this username
+    if [[ "$checked_usernames" == *"|$username|"* ]]; then
+      continue
+    fi
+
+    # Limit oEmbed checks for performance
+    if [ $oembed_count -ge $max_oembed_checks ]; then
+      break
+    fi
+
+    # Only fetch oEmbed for status URLs
+    if [[ "$url" =~ /status/[0-9]+ ]]; then
+      local oembed_data=$(fetch_oembed_data "$url")
+      if [ -n "$oembed_data" ]; then
+        oembed_count=$((oembed_count + 1))
+        checked_usernames="${checked_usernames}|${username}|"
+
+        local author_name=$(echo "$oembed_data" | grep -o '"author_name":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+        local author_url=$(echo "$oembed_data" | grep -o '"author_url":"[^"]*"' | cut -d':' -f2- | tr -d '"' | sed 's/\\//g')
+        local url_username=$(echo "$author_url" | sed 's|https://twitter.com/||' | sed 's|/.*||')
+
+        if [ -n "$author_name" ] && [ -n "$url_username" ]; then
+          echo "$username|$url_username|$author_name|$url" >>"$oembed_file"
+
+          # Track username changes (only once per username)
+          if [ "$username" != "$url_username" ]; then
+            if ! grep -q "^$username → " "$username_changes_file" 2>/dev/null; then
+              echo "$username → $url_username (display: $author_name)" >>"$username_changes_file"
+            fi
+          fi
+        fi
+      fi
+    fi
+  done
+
+  # Load oEmbed data into memory for enrichment
+  declare -A oembed_names
+  declare -A oembed_usernames
+  declare -A username_changes
+
+  if [ -s "$oembed_file" ]; then
+    while IFS='|' read -r orig_user current_user display_name url; do
+      oembed_names["$orig_user"]="$display_name"
+      oembed_usernames["$orig_user"]="$current_user"
+      if [ "$orig_user" != "$current_user" ]; then
+        username_changes["$orig_user"]="$current_user"
+      fi
+    done <"$oembed_file"
+  fi
 
   awk -F'|' '
     {
@@ -329,9 +404,27 @@ process_cdx_data() {
     sort_field="${sort_field}r"
   fi
 
-  sort -t'|' $sort_field "$processed_file"
+  # Enrich the sorted data with oEmbed information
+  local enriched_file=$(mktemp)
 
-  rm -f "$temp_file" "$processed_file" "$raw_data_file"
+  while IFS='|' read -r username count first last url; do
+    local display_name="${oembed_names[$username]:-}"
+    local current_username="${oembed_usernames[$username]:-}"
+    local changed_to="${username_changes[$username]:-}"
+
+    echo "$username|$count|$first|$last|$url|$display_name|$current_username|$changed_to"
+  done < <(sort -t'|' $sort_field "$processed_file") >"$enriched_file"
+
+  cat "$enriched_file"
+
+  # Output username changes summary if any were found
+  if [ -s "$username_changes_file" ] && [ "$VERBOSE" = 1 ]; then
+    echo "=USERNAME_CHANGES="
+    cat "$username_changes_file"
+    echo "=END_USERNAME_CHANGES="
+  fi
+
+  rm -f "$temp_file" "$processed_file" "$raw_data_file" "$oembed_file" "$username_changes_file" "$enriched_file"
 }
 
 output_raw() {
@@ -342,16 +435,18 @@ output_raw() {
   # Write processed data to a temporary file to avoid pipe issues
   echo "$processed_data" >"$temp_file"
 
-  while IFS='|' read -r username tweet_count first_seen last_seen sample_url; do
-    [ -z "$username" ] && continue
+  # Skip username changes section if present
+  grep -v "^=USERNAME_CHANGES=" "$temp_file" | grep -v "^=END_USERNAME_CHANGES=" |
+    while IFS='|' read -r username tweet_count first_seen last_seen sample_url display_name current_username changed_to; do
+      [ -z "$username" ] && continue
 
-    if [ "$LIMIT" -gt 0 ] && [ $count -ge "$LIMIT" ]; then
-      break
-    fi
+      if [ "$LIMIT" -gt 0 ] && [ $count -ge "$LIMIT" ]; then
+        break
+      fi
 
-    echo "$username"
-    count=$((count + 1))
-  done <"$temp_file"
+      echo "$username"
+      count=$((count + 1))
+    done
 
   rm -f "$temp_file"
 }
@@ -367,32 +462,46 @@ output_json() {
 
   echo "["
 
-  while IFS='|' read -r username tweet_count first_seen last_seen sample_url; do
-    [ -z "$username" ] && continue
+  # Skip username changes section if present
+  grep -v "^=USERNAME_CHANGES=" "$temp_file" | grep -v "^=END_USERNAME_CHANGES=" |
+    while IFS='|' read -r username tweet_count first_seen last_seen sample_url display_name current_username changed_to; do
+      [ -z "$username" ] && continue
 
-    if [ "$LIMIT" -gt 0 ] && [ $count -ge "$LIMIT" ]; then
-      break
-    fi
+      if [ "$LIMIT" -gt 0 ] && [ $count -ge "$LIMIT" ]; then
+        break
+      fi
 
-    if [ $first -eq 1 ]; then
-      first=0
-    else
-      echo ","
-    fi
+      if [ $first -eq 1 ]; then
+        first=0
+      else
+        echo ","
+      fi
 
-    local first_date=$(timestamp_to_date "$first_seen")
-    local last_date=$(timestamp_to_date "$last_seen")
+      local first_date=$(timestamp_to_date "$first_seen")
+      local last_date=$(timestamp_to_date "$last_seen")
 
-    printf '  {\n'
-    printf '    "username": "%s",\n' "$username"
-    printf '    "tweet_count": %s,\n' "$tweet_count"
-    printf '    "first_seen": "%s",\n' "$first_date"
-    printf '    "last_seen": "%s",\n' "$last_date"
-    printf '    "sample_url": "%s"\n' "$sample_url"
-    printf '  }'
+      printf '  {\n'
+      printf '    "username": "%s",\n' "$username"
+      printf '    "tweet_count": %s,\n' "$tweet_count"
+      printf '    "first_seen": "%s",\n' "$first_date"
+      printf '    "last_seen": "%s",\n' "$last_date"
+      printf '    "sample_url": "%s"' "$sample_url"
 
-    count=$((count + 1))
-  done <"$temp_file"
+      # Add oEmbed data if available
+      if [ -n "$display_name" ] || [ -n "$current_username" ] || [ -n "$changed_to" ]; then
+        printf ',\n    "oembed_data": {\n'
+        [ -n "$display_name" ] && printf '      "display_name": "%s",\n' "$display_name"
+        [ -n "$current_username" ] && printf '      "current_username": "%s",\n' "$current_username"
+        [ -n "$changed_to" ] && printf '      "username_changed_to": "%s",\n' "$changed_to"
+        # Remove trailing comma
+        printf '\b \b'
+        printf '\n    }'
+      fi
+
+      printf '\n  }'
+
+      count=$((count + 1))
+    done
 
   rm -f "$temp_file"
   echo ""
@@ -401,18 +510,30 @@ output_json() {
 
 output_pretty() {
   local processed_data="$1"
-  local total_usernames=$(echo "$processed_data" | wc -l)
-  local total_tweets=0
-  local count=0
   local temp_file=$(mktemp)
+  local changes_file=$(mktemp)
 
   # Write processed data to a temporary file to avoid pipe issues
   echo "$processed_data" >"$temp_file"
 
-  while IFS='|' read -r username tweet_count first_seen last_seen sample_url; do
-    [ -z "$username" ] && continue
-    total_tweets=$((total_tweets + tweet_count))
-  done <"$temp_file"
+  # Extract username changes if present
+  local has_changes=0
+  if grep -q "^=USERNAME_CHANGES=" "$temp_file"; then
+    has_changes=1
+    sed -n '/^=USERNAME_CHANGES=/,/^=END_USERNAME_CHANGES=/p' "$temp_file" |
+      grep -v "^=USERNAME_CHANGES=" | grep -v "^=END_USERNAME_CHANGES=" >"$changes_file"
+  fi
+
+  # Count usernames and tweets from the main data
+  local total_usernames=$(grep -v "^=USERNAME_CHANGES=" "$temp_file" | grep -v "^=END_USERNAME_CHANGES=" | grep -v "^$" | wc -l)
+  local total_tweets=0
+  local count=0
+
+  grep -v "^=USERNAME_CHANGES=" "$temp_file" | grep -v "^=END_USERNAME_CHANGES=" |
+    while IFS='|' read -r username tweet_count first_seen last_seen sample_url display_name current_username changed_to; do
+      [ -z "$username" ] && continue
+      total_tweets=$((total_tweets + tweet_count))
+    done
 
   printf "${bold}${green}Twitter Username OSINT Results${reset}\n"
   printf "${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}\n\n"
@@ -440,41 +561,64 @@ output_pretty() {
   fi
   printf "${reset}\n"
 
-  while IFS='|' read -r username tweet_count first_seen last_seen sample_url; do
-    [ -z "$username" ] && continue
+  grep -v "^=USERNAME_CHANGES=" "$temp_file" | grep -v "^=END_USERNAME_CHANGES=" |
+    while IFS='|' read -r username tweet_count first_seen last_seen sample_url display_name current_username changed_to; do
+      [ -z "$username" ] && continue
 
-    if [ "$LIMIT" -gt 0 ] && [ $count -ge "$LIMIT" ]; then
-      break
-    fi
+      if [ "$LIMIT" -gt 0 ] && [ $count -ge "$LIMIT" ]; then
+        break
+      fi
 
-    local first_date=$(timestamp_to_date "$first_seen")
-    local last_date=$(timestamp_to_date "$last_seen")
+      local first_date=$(timestamp_to_date "$first_seen")
+      local last_date=$(timestamp_to_date "$last_seen")
 
-    local count_color="$reset"
-    if [ "${tweet_count:-0}" -gt 100 ]; then
-      count_color="$green"
-    elif [ "${tweet_count:-0}" -gt 10 ]; then
-      count_color="$yellow"
-    else
-      count_color="$red"
-    fi
+      local count_color="$reset"
+      if [ "${tweet_count:-0}" -gt 100 ]; then
+        count_color="$green"
+      elif [ "${tweet_count:-0}" -gt 10 ]; then
+        count_color="$yellow"
+      else
+        count_color="$red"
+      fi
 
-    printf "${blue}%-20s${reset} ${count_color}%8s${reset} ${magenta}%12s${reset} ${magenta}%12s${reset}" \
-      "$username" "$tweet_count" "$first_date" "$last_date"
+      printf "${blue}%-20s${reset} ${count_color}%8s${reset} ${magenta}%12s${reset} ${magenta}%12s${reset}" \
+        "$username" "$tweet_count" "$first_date" "$last_date"
 
-    if [ "$SHOW_URLS" = 1 ] || [ "$VERBOSE" = 1 ]; then
-      printf " ${gray}%s${reset}" "$sample_url"
-    fi
-    printf "\n"
+      if [ "$SHOW_URLS" = 1 ] || [ "$VERBOSE" = 1 ]; then
+        printf " ${gray}%s${reset}" "$sample_url"
+      fi
+      printf "\n"
 
-    if [ "$SHOW_DATES" = 1 ] && [ "$SHOW_URLS" != 1 ] && [ "$VERBOSE" != 1 ]; then
-      printf "  ${gray}First: %s, Last: %s${reset}\n" "$first_date" "$last_date"
-    fi
+      # Show oEmbed data if available and verbose mode is on
+      if [ "$VERBOSE" = 1 ] && [ -n "$display_name" ]; then
+        printf "  ${gray}├─ Display Name: ${yellow}%s${reset}\n" "$display_name"
+        if [ -n "$current_username" ] && [ "$current_username" != "$username" ]; then
+          printf "  ${gray}├─ Current Username: ${cyan}@%s${reset}\n" "$current_username"
+        fi
+        if [ -n "$changed_to" ]; then
+          printf "  ${gray}└─ Username Changed To: ${red}@%s${reset}\n" "$changed_to"
+        fi
+      elif [ -n "$changed_to" ]; then
+        printf "  ${red}→ @%s${reset}\n" "$changed_to"
+      fi
 
-    count=$((count + 1))
-  done <"$temp_file"
+      if [ "$SHOW_DATES" = 1 ] && [ "$SHOW_URLS" != 1 ] && [ "$VERBOSE" != 1 ]; then
+        printf "  ${gray}First: %s, Last: %s${reset}\n" "$first_date" "$last_date"
+      fi
 
-  rm -f "$temp_file"
+      count=$((count + 1))
+    done
+
+  # Show username changes summary if in verbose mode
+  if [ "$has_changes" = 1 ] && [ "$VERBOSE" = 1 ] && [ -s "$changes_file" ]; then
+    printf "\n${bold}${yellow}Username Changes Detected:${reset}\n"
+    printf "${gray}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}\n"
+    while IFS= read -r change; do
+      printf "${red}%s${reset}\n" "$change"
+    done <"$changes_file"
+  fi
+
+  rm -f "$temp_file" "$changes_file"
 
   if [ "$LIMIT" -gt 0 ] && [ "$total_usernames" -gt "$LIMIT" ]; then
     printf "\n${gray}Showing %s of %s results (use --limit 0 to show all)${reset}\n" "$LIMIT" "$total_usernames"
