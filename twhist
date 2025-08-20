@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
 
-# Twitter username OSINT tool using CDX (Common Crawl Index)
-
-# Default values
 USERNAME=""
 OUTPUT="pretty"
 LIMIT="0"
@@ -17,7 +14,7 @@ VERBOSE=0
 
 show_usage() {
   cat <<'EOF'
-Twitter username OSINT tool using CDX (Common Crawl Index)
+Twitter/X username OSINT tool using CDX
 
 USAGE:
     twitter-osint.sh <username> [OPTIONS]
@@ -35,7 +32,6 @@ OPTIONS:
     --show-urls             Show sample URLs for each username
     --show-dates            Show first/last seen dates
     -q, --quiet             Suppress colored output and progress indicators
-    -v, --verbose           Show detailed information including sample URLs
     -h, --help              Show this help message
 
 EXAMPLES:
@@ -199,13 +195,13 @@ fetch_cdx_data() {
   local username="$1"
   local url="http://web.archive.org/cdx/search/cdx?url=twitter.com/${username}*&output=text&fl=timestamp,original&collapse=urlkey"
 
-  show_progress "Querying CDX for username: ${username}"
+  show_progress "Searching for username: ${username}"
 
   local response=$(curl -s "$url" 2>/dev/null)
   local curl_exit=$?
 
   if [ $curl_exit -ne 0 ]; then
-    error_exit "Failed to fetch data from CDX API (curl exit code: $curl_exit)"
+    error_exit "Failed to fetch data from CDX (curl exit code: $curl_exit)"
   fi
 
   if [ -z "$response" ]; then
@@ -243,7 +239,7 @@ process_cdx_data() {
 
   # Count the total number of lines for progress reporting
   local total_lines=$(wc -l <"$raw_data_file")
-  show_progress "Processing $total_lines records from CDX data..."
+  show_progress "Processing $total_lines records..."
 
   # Use a timeout to prevent hanging
   local timeout_seconds=300 # 5 minutes timeout
@@ -294,14 +290,12 @@ process_cdx_data() {
     return 1
   fi
 
-  show_progress "Aggregating data for usernames..."
-
   # Collect oEmbed data for a sample of tweets per username
-  show_progress "Fetching oEmbed data for username verification..."
+  show_progress "Analyzing data for username verification..."
 
   # Get unique usernames and their sample URLs (limit to 10 for performance)
   local oembed_count=0
-  local max_oembed_checks=10
+  local max_oembed_checks=5000
   local checked_usernames=""
 
   awk -F'|' '{print $2 "|" $3}' "$temp_file" | sort -u | while IFS='|' read -r username url; do
@@ -322,17 +316,25 @@ process_cdx_data() {
         oembed_count=$((oembed_count + 1))
         checked_usernames="${checked_usernames}|${username}|"
 
-        local author_name=$(echo "$oembed_data" | grep -o '"author_name":"[^"]*"' | cut -d':' -f2 | tr -d '"')
-        local author_url=$(echo "$oembed_data" | grep -o '"author_url":"[^"]*"' | cut -d':' -f2- | tr -d '"' | sed 's/\\//g')
+        local author_name=$(echo "$oembed_data" | sed -n 's/.*"author_name":"\([^"]*\)".*/\1/p')
+        local author_url=$(echo "$oembed_data" | sed -n 's/.*"author_url":"\([^"]*\)".*/\1/p' | sed 's/\\//g')
         local url_username=$(echo "$author_url" | sed 's|https://twitter.com/||' | sed 's|/.*||')
 
         if [ -n "$author_name" ] && [ -n "$url_username" ]; then
-          echo "$username|$url_username|$author_name|$url" >>"$oembed_file"
+          if [[ ! "$author_name" =~ (404|[Pp]age.not.found|[Ee]rror|[Nn]ot.[Ff]ound) ]]; then
+            echo "$username|$url_username|$author_name|$url" >>"$oembed_file"
+          else
+            echo "$username|$url_username||$url" >>"$oembed_file"
+          fi
 
-          # Track username changes (only once per username)
           if [ "$username" != "$url_username" ]; then
             if ! grep -q "^$username → " "$username_changes_file" 2>/dev/null; then
-              echo "$username → $url_username (display: $author_name)" >>"$username_changes_file"
+              # Only include display name if it doesn't contain error indicators
+              if [[ ! "$author_name" =~ (404|[Pp]age.not.found|[Ee]rror|[Nn]ot.[Ff]ound) ]]; then
+                echo "$username → $url_username (display: $author_name)" >>"$username_changes_file"
+              else
+                echo "$username → $url_username" >>"$username_changes_file"
+              fi
             fi
           fi
         fi
@@ -353,6 +355,9 @@ process_cdx_data() {
         username_changes["$orig_user"]="$current_user"
       fi
     done <"$oembed_file"
+
+    # Debug: show loaded data
+    show_progress "Loaded ${#oembed_names[@]} oEmbed entries"
   fi
 
   awk -F'|' '
@@ -550,12 +555,12 @@ output_pretty() {
   printf "\n\n"
 
   printf "${bold}Results:${reset}\n"
-  printf "${bold}%-20s %8s %12s %12s${reset}" "Username" "Tweets" "First Seen" "Last Seen"
+  printf "${bold}%-40s %8s %12s %12s${reset}" "Username" "Tweets" "First Seen" "Last Seen"
   if [ "$SHOW_URLS" = 1 ] || [ "$VERBOSE" = 1 ]; then
     printf " %s" "Sample URL"
   fi
   printf "\n"
-  printf "${gray}%-20s %8s %12s %12s" "--------" "------" "-----------" "----------"
+  printf "${gray}%-40s %8s %12s %12s" "--------" "------" "-----------" "----------"
   if [ "$SHOW_URLS" = 1 ] || [ "$VERBOSE" = 1 ]; then
     printf " %s" "----------"
   fi
@@ -581,25 +586,36 @@ output_pretty() {
         count_color="$red"
       fi
 
-      printf "${blue}%-20s${reset} ${count_color}%8s${reset} ${magenta}%12s${reset} ${magenta}%12s${reset}" \
-        "$username" "$tweet_count" "$first_date" "$last_date"
+      # Format username with display name if available
+      local username_display="$username"
+      if [ -n "$display_name" ]; then
+        # Truncate display name if too long
+        local max_display_len=25
+        local truncated_display="$display_name"
+        if [ ${#display_name} -gt $max_display_len ]; then
+          truncated_display="${display_name:0:$max_display_len}..."
+        fi
+        username_display="$username ($truncated_display)"
+      fi
+
+      printf "${blue}%-40s${reset} ${count_color}%8s${reset} ${magenta}%12s${reset} ${magenta}%12s${reset}" \
+        "$username_display" "$tweet_count" "$first_date" "$last_date"
 
       if [ "$SHOW_URLS" = 1 ] || [ "$VERBOSE" = 1 ]; then
         printf " ${gray}%s${reset}" "$sample_url"
       fi
       printf "\n"
 
-      # Show oEmbed data if available and verbose mode is on
-      if [ "$VERBOSE" = 1 ] && [ -n "$display_name" ]; then
-        printf "  ${gray}├─ Display Name: ${yellow}%s${reset}\n" "$display_name"
+      # Show oEmbed data if available (skip display name since it's shown inline)
+      if ([ -n "$current_username" ] || [ -n "$changed_to" ]); then
         if [ -n "$current_username" ] && [ "$current_username" != "$username" ]; then
           printf "  ${gray}├─ Current Username: ${cyan}@%s${reset}\n" "$current_username"
         fi
         if [ -n "$changed_to" ]; then
           printf "  ${gray}└─ Username Changed To: ${red}@%s${reset}\n" "$changed_to"
         fi
-      elif [ -n "$changed_to" ]; then
-        printf "  ${red}→ @%s${reset}\n" "$changed_to"
+      # elif [ -n "$changed_to" ]; then
+      #   printf "  ${red}→ @%s${reset}\n" "$changed_to"
       fi
 
       if [ "$SHOW_DATES" = 1 ] && [ "$SHOW_URLS" != 1 ] && [ "$VERBOSE" != 1 ]; then
@@ -641,7 +657,6 @@ main() {
     exit 0
   fi
 
-  show_progress "Processing CDX data..."
   local processed_data=$(process_cdx_data "$cdx_data")
 
   if [ -z "$processed_data" ]; then
