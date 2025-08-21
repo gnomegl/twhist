@@ -233,7 +233,7 @@ process_cdx_data() {
   local total_lines=$(wc -l <"$raw_data_file")
   show_progress "Processing $total_lines records..."
 
-  local timeout_seconds=300 
+  local timeout_seconds=300
   local start_time=$(date +%s)
   local line_count=0
   local progress_interval=$((total_lines > 100 ? total_lines / 10 : 10))
@@ -280,7 +280,7 @@ process_cdx_data() {
 
   local oembed_count=0
   local max_oembed_checks=5000
-  
+
   local unique_usernames_file=$(mktemp)
   # Get one URL per unique username (preferring URLs with /status/)
   awk -F'|' '
@@ -296,23 +296,23 @@ process_cdx_data() {
         print u "|" seen[u]
       }
     }
-  ' "$temp_file" | sort > "$unique_usernames_file"
-  
-  local total_unique_usernames=$(wc -l < "$unique_usernames_file")
+  ' "$temp_file" | sort >"$unique_usernames_file"
+
+  local total_unique_usernames=$(wc -l <"$unique_usernames_file")
   local usernames_processed=0
-  
+
   if command -v parallel >/dev/null 2>&1 && [ "$total_unique_usernames" -gt 10 ]; then
     show_progress "Using parallel processing for $total_unique_usernames usernames..."
-    
+
     # Export the function and variables for parallel to use
     export -f fetch_oembed_data
     export FILTER QUIET
-    
+
     # Start a background progress monitor
     local progress_monitor_pid=""
     local processed_count=0
     local total_count=$total_unique_usernames
-    
+
     # Function to show progress
     show_parallel_progress() {
       while [ $processed_count -lt $total_count ]; do
@@ -320,11 +320,11 @@ process_cdx_data() {
         sleep 2
       done
     }
-    
+
     # Start progress monitor in background
     show_parallel_progress &
     progress_monitor_pid=$!
-    
+
     # Process in batches of 50 to avoid overwhelming the server
     parallel -j 10 --timeout 30 --colsep '|' --block 1M '
       username="{1}"
@@ -348,19 +348,19 @@ process_cdx_data() {
       fi
       # Signal progress
       echo "progress" >&2
-    ' < "$unique_usernames_file" 2> >(while read -r line; do
+    ' <"$unique_usernames_file" 2> >(while read -r line; do
       if [ "$line" = "progress" ]; then
         processed_count=$((processed_count + 1))
       fi
-    done) | head -n $max_oembed_checks > "$oembed_file"
-    
+    done) | head -n $max_oembed_checks >"$oembed_file"
+
     # Stop the progress monitor
     processed_count=$total_count
     kill $progress_monitor_pid 2>/dev/null || true
     wait $progress_monitor_pid 2>/dev/null || true
     show_progress "Parallel processing completed for $total_count usernames"
   else
-  
+
     while IFS='|' read -r username url; do
       usernames_processed=$((usernames_processed + 1))
       show_progress "Processing username... $usernames_processed of $total_unique_usernames"
@@ -398,7 +398,7 @@ process_cdx_data() {
           fi
         fi
       fi
-    done < "$unique_usernames_file"
+    done <"$unique_usernames_file"
   fi
 
   show_progress "Username verification completed"
@@ -578,14 +578,14 @@ output_json() {
         fi
         printf '\n    }'
       fi
-      
+
       printf '\n  }'
       count=$((count + 1))
     done
 
   echo ""
   echo "]"
-  
+
   rm -f "$temp_file"
 }
 
@@ -593,7 +593,7 @@ display_default() {
   local processed_data="$1"
   local temp_file=$(mktemp)
   local changes_file=$(mktemp)
-  
+
   # Write processed data to a temporary file to avoid pipe issues
   echo "$processed_data" >"$temp_file"
 
