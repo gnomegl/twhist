@@ -17,7 +17,7 @@ show_usage() {
 Twitter/X username OSINT tool using CDX
 
 USAGE:
-    twitter-osint.sh <username> [OPTIONS]
+    twhist <username> [OPTIONS]
 
 ARGUMENTS:
     <username>          Twitter username to search for (without @)
@@ -35,17 +35,16 @@ OPTIONS:
     -h, --help              Show this help message
 
 EXAMPLES:
-    twitter-osint.sh elonmusk
-    twitter-osint.sh twitter --output json --limit 10
-    twitter-osint.sh example --sort count --reverse --min-count 5
-    twitter-osint.sh user --filter "bot" --show-urls
+    twhist elonmusk
+    twhist twitter --output json --limit 10
+    twhist example --sort count --reverse --min-count 5
+    twhist user --filter "bot" --show-urls
 
 REQUIRED TOOLS:
     curl, awk, sed, sort, uniq, date
 EOF
 }
 
-# Parse command line arguments
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case $1 in
@@ -110,14 +109,12 @@ parse_args() {
     esac
   done
 
-  # Check if username was provided
   if [ -z "$USERNAME" ]; then
     echo "Error: Username is required" >&2
     show_usage >&2
     exit 1
   fi
 
-  # Validate output format
   case "$OUTPUT" in
   pretty | raw | json) ;;
   *)
@@ -126,7 +123,6 @@ parse_args() {
     ;;
   esac
 
-  # Validate sort field
   case "$SORT" in
   username | count | first_seen | last_seen) ;;
   *)
@@ -135,7 +131,6 @@ parse_args() {
     ;;
   esac
 
-  # Validate numeric arguments
   if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
     echo "Error: Invalid limit '$LIMIT'. Must be a number." >&2
     exit 1
@@ -218,7 +213,6 @@ fetch_oembed_data() {
 
   local response=$(curl -s "$oembed_url" 2>/dev/null)
 
-  # Check if response contains actual oEmbed data
   if echo "$response" | grep -q '"author_name"'; then
     echo "$response"
   else
@@ -234,24 +228,19 @@ process_cdx_data() {
   local oembed_file=$(mktemp)
   local username_changes_file=$(mktemp)
 
-  # Write CDX data to a temporary file to avoid pipe issues
   echo "$cdx_data" >"$raw_data_file"
 
-  # Count the total number of lines for progress reporting
   local total_lines=$(wc -l <"$raw_data_file")
   show_progress "Processing $total_lines records..."
 
-  # Use a timeout to prevent hanging
-  local timeout_seconds=300 # 5 minutes timeout
+  local timeout_seconds=300 
   local start_time=$(date +%s)
   local line_count=0
   local progress_interval=$((total_lines > 100 ? total_lines / 10 : 10))
 
-  # Process the data line by line from the file instead of using a pipe
   while IFS=' ' read -r timestamp original_url; do
     [ -z "$timestamp" ] || [ -z "$original_url" ] && continue
 
-    # Check for timeout
     local current_time=$(date +%s)
     local elapsed_time=$((current_time - start_time))
     if [ $elapsed_time -gt $timeout_seconds ]; then
@@ -261,7 +250,6 @@ process_cdx_data() {
 
     line_count=$((line_count + 1))
 
-    # Show progress every 10% or 10 lines
     if [ $((line_count % progress_interval)) -eq 0 ]; then
       show_progress "Processed $line_count of $total_lines records ($((line_count * 100 / total_lines))%)..."
     fi
@@ -270,7 +258,6 @@ process_cdx_data() {
 
     [ -z "$extracted_username" ] && continue
 
-    # Skip invalid usernames like "http:"
     [[ "$extracted_username" == "http:" ]] && continue
     [[ ! "$extracted_username" =~ ^[a-zA-Z0-9_]+$ ]] && continue
 
@@ -283,90 +270,113 @@ process_cdx_data() {
     echo "$timestamp|$extracted_username|$original_url" >>"$temp_file"
   done <"$raw_data_file"
 
-  # Check if we processed any data
   if [ ! -s "$temp_file" ]; then
     show_progress "No usernames found in the processed data."
     rm -f "$temp_file" "$processed_file" "$raw_data_file" "$oembed_file" "$username_changes_file"
     return 1
   fi
 
-  # Collect oEmbed data for a sample of tweets per username
   show_progress "Analyzing data for username verification..."
 
-  # Get unique usernames and their sample URLs (limit to 10 for performance)
   local oembed_count=0
   local max_oembed_checks=5000
   local checked_usernames=""
   
-  # Create a temporary file with unique username-URL pairs to avoid subshell issues
   local unique_usernames_file=$(mktemp)
   awk -F'|' '{print $2 "|" $3}' "$temp_file" | sort -u > "$unique_usernames_file"
   
-  # Count total unique usernames for progress reporting (actual unique usernames, not username-URL pairs)
   local total_unique_usernames=$(awk -F'|' '{print $2}' "$temp_file" | sort -u | wc -l)
   local usernames_processed=0
   
-  # Limit to 4 username checks for progress display
-  local max_progress_checks=4
-  if [ $total_unique_usernames -lt $max_progress_checks ]; then
-    max_progress_checks=$total_unique_usernames
-  fi
-
-  while IFS='|' read -r username url; do
-    # Skip if we already checked this username
-    if [[ "$checked_usernames" == *"|$username|"* ]]; then
-      continue
-    fi
+  if command -v parallel >/dev/null 2>&1 && [ "$total_unique_usernames" -gt 10 ]; then
+    show_progress "Using parallel processing for $total_unique_usernames usernames..."
     
-    # Only show progress for first 4 usernames
-    if [ $usernames_processed -lt $max_progress_checks ]; then
-      usernames_processed=$((usernames_processed + 1))
-      show_progress "Processing username... $usernames_processed of $max_progress_checks"
-    fi
-
-    # Limit oEmbed checks for performance
-    if [ $oembed_count -ge $max_oembed_checks ]; then
-      show_progress "Reached maximum verification limit ($max_oembed_checks checks)"
-      break
-    fi
-
-    # Only fetch oEmbed for status URLs
-    if [[ "$url" =~ /status/[0-9]+ ]]; then
-      local oembed_data=$(fetch_oembed_data "$url")
-      if [ -n "$oembed_data" ]; then
-        oembed_count=$((oembed_count + 1))
-        checked_usernames="${checked_usernames}|${username}|"
-
-        local author_name=$(echo "$oembed_data" | sed -n 's/.*"author_name":"\([^"]*\)".*/\1/p')
-        local author_url=$(echo "$oembed_data" | sed -n 's/.*"author_url":"\([^"]*\)".*/\1/p' | sed 's/\\//g')
-        local url_username=$(echo "$author_url" | sed 's|https://twitter.com/||' | sed 's|/.*||')
-
-        if [ -n "$author_name" ] && [ -n "$url_username" ]; then
-          if [[ ! "$author_name" =~ (404|[Pp]age.not.found|[Ee]rror|[Nn]ot.[Ff]ound) ]]; then
-            echo "$username|$url_username|$author_name|$url" >>"$oembed_file"
-          else
-            echo "$username|$url_username||$url" >>"$oembed_file"
+    export -f fetch_oembed_data
+    export FILTER QUIET
+    
+    parallel -j 10 --timeout 30 --colsep '|' --block 1M '
+      username="{1}"
+      url="{2}"
+      
+      if [[ "$url" =~ /status/[0-9]+ ]]; then
+        oembed_data=$(fetch_oembed_data "$url")
+        if [ -n "$oembed_data" ]; then
+          author_name=$(echo "$oembed_data" | sed -n '\''s/.*"author_name":"\([^"]*\)".*/\1/p'\'')
+          author_url=$(echo "$oembed_data" | sed -n '\''s/.*"author_url":"\([^"]*\)".*/\1/p'\'' | sed '\''s/\\//g'\'')
+          url_username=$(echo "$author_url" | sed '\''s|https://twitter.com/||'\'' | sed '\''s|/.*||'\'')
+          
+          if [ -n "$author_name" ] && [ -n "$url_username" ]; then
+            if [[ ! "$author_name" =~ (404|[Pp]age.not.found|[Ee]rror|[Nn]ot.[Ff]ound) ]]; then
+              echo "$username|$url_username|$author_name|$url"
+            else
+              echo "$username|$url_username||$url"
+            fi
           fi
+        fi
+      fi
+    ' < "$unique_usernames_file" | head -n $max_oembed_checks > "$oembed_file"
+  else
+  
+    while IFS='|' read -r username url; do
+      if [[ "$checked_usernames" == *"|${username}|"* ]]; then
+        continue
+      fi
+      
+      usernames_processed=$((usernames_processed + 1))
+      show_progress "Processing username... $usernames_processed of $total_unique_usernames"
 
-          if [ "$username" != "$url_username" ]; then
-            if ! grep -q "^$username → " "$username_changes_file" 2>/dev/null; then
-              # Only include display name if it doesn't contain error indicators
-              if [[ ! "$author_name" =~ (404|[Pp]age.not.found|[Ee]rror|[Nn]ot.[Ff]ound) ]]; then
-                echo "$username → $url_username (display: $author_name)" >>"$username_changes_file"
-              else
-                echo "$username → $url_username" >>"$username_changes_file"
+      if [ $oembed_count -ge $max_oembed_checks ]; then
+        show_progress "Reached maximum verification limit ($max_oembed_checks checks)"
+        break
+      fi
+
+      if [[ "$url" =~ /status/[0-9]+ ]]; then
+        local oembed_data=$(fetch_oembed_data "$url")
+        if [ -n "$oembed_data" ]; then
+          oembed_count=$((oembed_count + 1))
+          checked_usernames="${checked_usernames}|${username}|"
+
+          local author_name=$(echo "$oembed_data" | sed -n 's/.*"author_name":"\([^"]*\)".*/\1/p')
+          local author_url=$(echo "$oembed_data" | sed -n 's/.*"author_url":"\([^"]*\)".*/\1/p' | sed 's/\\//g')
+          local url_username=$(echo "$author_url" | sed 's|https://twitter.com/||' | sed 's|/.*||')
+
+          if [ -n "$author_name" ] && [ -n "$url_username" ]; then
+            if [[ ! "$author_name" =~ (404|[Pp]age.not.found|[Ee]rror|[Nn]ot.[Ff]ound) ]]; then
+              echo "$username|$url_username|$author_name|$url" >>"$oembed_file"
+            else
+              echo "$username|$url_username||$url" >>"$oembed_file"
+            fi
+
+            if [ "$username" != "$url_username" ]; then
+              if ! grep -q "^$username → " "$username_changes_file" 2>/dev/null; then
+                if [[ ! "$author_name" =~ (404|[Pp]age.not.found|[Ee]rror|[Nn]ot.[Ff]ound) ]]; then
+                  echo "$username → $url_username (display: $author_name)" >>"$username_changes_file"
+                else
+                  echo "$username → $url_username" >>"$username_changes_file"
+                fi
               fi
             fi
           fi
         fi
       fi
-    fi
-  done < "$unique_usernames_file"
-  
-  # Show completion message
+    done < "$unique_usernames_file"
+  fi
+
   show_progress "Username verification completed"
 
-  # Load oEmbed data into memory for enrichment
+  if [ -s "$oembed_file" ]; then
+    while IFS='|' read -r orig_user current_user display_name url; do
+      if [ "$orig_user" != "$current_user" ]; then
+        if ! grep -q "^$orig_user → " "$username_changes_file" 2>/dev/null; then
+          if [[ ! "$display_name" =~ (404|[Pp]age.not.found|[Ee]rror|[Nn]ot.[Ff]ound) ]]; then
+            echo "$orig_user → $current_user (display: $display_name)" >>"$username_changes_file"
+          else
+            echo "$orig_user → $current_user" >>"$username_changes_file"
+          fi
+        fi
+      fi
+    done <"$oembed_file"
+  fi
   declare -A oembed_names
   declare -A oembed_usernames
   declare -A username_changes
@@ -433,7 +443,6 @@ process_cdx_data() {
     sort_field="${sort_field}r"
   fi
 
-  # Enrich the sorted data with oEmbed information
   local enriched_file=$(mktemp)
 
   while IFS='|' read -r username count first last url; do
@@ -446,7 +455,6 @@ process_cdx_data() {
 
   cat "$enriched_file"
 
-  # Output username changes summary if any were found
   if [ -s "$username_changes_file" ] && [ "$VERBOSE" = 1 ]; then
     echo "=USERNAME_CHANGES="
     cat "$username_changes_file"
@@ -461,7 +469,6 @@ output_raw() {
   local count=0
   local temp_file=$(mktemp)
 
-  # Write processed data to a temporary file to avoid pipe issues
   echo "$processed_data" >"$temp_file"
 
   # Skip username changes section if present
@@ -486,12 +493,10 @@ output_json() {
   local first=1
   local temp_file=$(mktemp)
 
-  # Write processed data to a temporary file to avoid pipe issues
   echo "$processed_data" >"$temp_file"
 
   echo "["
 
-  # Skip username changes section if present
   grep -v "^=USERNAME_CHANGES=" "$temp_file" | grep -v "^=END_USERNAME_CHANGES=" |
     while IFS='|' read -r username tweet_count first_seen last_seen sample_url display_name current_username changed_to; do
       [ -z "$username" ] && continue
@@ -516,33 +521,12 @@ output_json() {
       printf '    "last_seen": "%s",\n' "$last_date"
       printf '    "sample_url": "%s"' "$sample_url"
 
-      # Add oEmbed data if available
       if [ -n "$display_name" ] || [ -n "$current_username" ] || [ -n "$changed_to" ]; then
         printf ',\n    "oembed_data": {\n'
         [ -n "$display_name" ] && printf '      "display_name": "%s",\n' "$display_name"
         [ -n "$current_username" ] && printf '      "current_username": "%s",\n' "$current_username"
         [ -n "$changed_to" ] && printf '      "username_changed_to": "%s",\n' "$changed_to"
-        # Remove trailing comma
-        printf '\b \b'
-        printf '\n    }'
-      fi
-
-      printf '\n  }'
-
-      count=$((count + 1))
-    done
-
-  rm -f "$temp_file"
-  echo ""
-  echo "]"
-}
-
-output_pretty() {
-  local processed_data="$1"
-  local temp_file=$(mktemp)
-  local changes_file=$(mktemp)
-
-  # Write processed data to a temporary file to avoid pipe issues
+        # Write processed data to a temporary file to avoid pipe issues
   echo "$processed_data" >"$temp_file"
 
   # Extract username changes if present
@@ -565,17 +549,6 @@ output_pretty() {
     done
 
   printf "${bold}${green}Results:${reset}\n"
-
-  # printf "${bold}Summary:${reset}\n"
-  # printf "  ${cyan}Total Usernames Found:${reset} ${yellow}%s${reset}\n" "$total_usernames"
-  # printf "  ${cyan}Total Archived Tweets:${reset} ${yellow}%s${reset}\n" "$total_tweets"
-  # printf "  ${cyan}Minimum Tweet Count:${reset} ${yellow}%s${reset}\n" "$MIN_COUNT"
-  # if [ -n "$FILTER" ]; then
-  #   printf "  ${cyan}Filter Applied:${reset} ${yellow}%s${reset}\n" "$FILTER"
-  # fi
-  # printf "  ${cyan}Sort Order:${reset} ${yellow}%s${reset}" "$SORT"
-  # [ "$REVERSE" = 1 ] && printf " ${gray}(reversed)${reset}"
-  # printf "\n\n"
 
   printf "${bold}%-40s %8s %12s %12s${reset}" "Username" "Tweets" "First Seen" "Last Seen"
   if [ "$SHOW_URLS" = 1 ] || [ "$VERBOSE" = 1 ]; then
@@ -608,10 +581,8 @@ output_pretty() {
         count_color="$red"
       fi
 
-      # Format username with display name if available
       local username_display="$username"
       if [ -n "$display_name" ]; then
-        # Truncate display name if too long
         local max_display_len=25
         local truncated_display="$display_name"
         if [ ${#display_name} -gt $max_display_len ]; then
@@ -628,7 +599,6 @@ output_pretty() {
       fi
       printf "\n"
 
-      # Show oEmbed data if available (skip display name since it's shown inline)
       if ([ -n "$current_username" ] || [ -n "$changed_to" ]); then
         if [ -n "$current_username" ] && [ "$current_username" != "$username" ]; then
           printf "  ${gray}├─ Current Username: ${cyan}@%s${reset}\n" "$current_username"
@@ -647,7 +617,6 @@ output_pretty() {
       count=$((count + 1))
     done
 
-  # Show username changes summary if in verbose mode
   if [ "$has_changes" = 1 ] && [ "$VERBOSE" = 1 ] && [ -s "$changes_file" ]; then
     printf "\n${bold}${yellow}Username Changes Detected:${reset}\n"
     printf "${gray}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}\n"
